@@ -7,10 +7,15 @@ import { createRequire } from "node:module";
 import { fileURLToPath } from "node:url";
 import type { Model, Api } from "@earendil-works/pi-ai/compat";
 import {
+	clearOpenCodeProjectIdCache,
 	createOpenCodeHeaders,
-	createOpenCodeStreamSimple,
 	createOpenCodeSessionTracker,
+	createOpenCodeStreamSimple,
+	createOpenCodeTraceHeaders,
 	getOpenCodeModelBaseUrl,
+	normalizeOpenCodeGitRemote,
+	openCodeProjectIdFromRemote,
+	resolveOpenCodeProjectId,
 	resolveOpenCodeModelApi,
 } from "../providers/opencode-session.js";
 
@@ -61,10 +66,14 @@ describe("opencode-session fallback resolution", () => {
 
 	it("generates CLI-compatible session and request headers", () => {
 		const tracker = createOpenCodeSessionTracker();
-		const first = createOpenCodeHeaders(tracker);
-		const second = createOpenCodeHeaders(tracker);
+		const first = createOpenCodeHeaders(tracker, undefined, {
+			projectId: "global",
+		});
+		const second = createOpenCodeHeaders(tracker, undefined, {
+			projectId: "global",
+		});
 
-		expect(first["User-Agent"]).toBe("opencode/1.18.18");
+		expect(first["User-Agent"]).toBe("opencode/latest/2.0.29/cli");
 		expect(first["x-opencode-client"]).toBe("cli");
 		expect(first["x-opencode-session"]).toMatch(
 			/^ses_[0-9a-f]{12}[0-9A-Za-z]{14}$/,
@@ -73,8 +82,79 @@ describe("opencode-session fallback resolution", () => {
 			/^prt_[0-9a-f]{12}[0-9A-Za-z]{14}$/,
 		);
 		expect(first["x-opencode-project"]).toBe("global");
+		// Session affinity aliases share the same session id.
+		expect(first["x-opencode-session-id"]).toBe(first["x-opencode-session"]);
+		expect(first["x-session-affinity"]).toBe(first["x-opencode-session"]);
+		expect(first["x-session-id"]).toBe(first["x-opencode-session"]);
+		// OTEL propagation headers are fresh per request.
+		expect(first["traceparent"]).toMatch(/^00-[0-9a-f]{32}-[0-9a-f]{16}-01$/);
+		expect(first["b3"]).toMatch(/^[0-9a-f]{32}-[0-9a-f]{16}-1$/);
+		const b3Trace = String(first["b3"]).split("-")[0];
+		expect(String(first["traceparent"])).toContain(b3Trace);
 		expect(second["x-opencode-session"]).toBe(first["x-opencode-session"]);
+		expect(second["x-opencode-session-id"]).toBe(first["x-opencode-session"]);
+		expect(second["x-session-affinity"]).toBe(first["x-opencode-session"]);
+		expect(second["x-session-id"]).toBe(first["x-opencode-session"]);
 		expect(second["x-opencode-request"]).not.toBe(first["x-opencode-request"]);
+		expect(second["traceparent"]).not.toBe(first["traceparent"]);
+		expect(second["b3"]).not.toBe(first["b3"]);
+	});
+
+	it("resolves x-opencode-project from the git remote (sha1)", () => {
+		// Mirrors packages/core/src/project.ts: sha1("git-remote:<host>/<path>").
+		expect(
+			normalizeOpenCodeGitRemote("https://github.com/owner/repo.git"),
+		).toBe("github.com/owner/repo");
+		expect(normalizeOpenCodeGitRemote("git@github.com:owner/repo.git")).toBe(
+			"github.com/owner/repo",
+		);
+		expect(normalizeOpenCodeGitRemote("file:///tmp/x")).toBeUndefined();
+		expect(normalizeOpenCodeGitRemote("")).toBeUndefined();
+
+		const id = openCodeProjectIdFromRemote("git@github.com:owner/repo.git");
+		expect(id).toMatch(/^[0-9a-f]{40}$/);
+		expect(openCodeProjectIdFromRemote("file:///tmp/x")).toBeUndefined();
+		expect(openCodeProjectIdFromRemote("")).toBeUndefined();
+
+		// Explicit override wins without touching git.
+		clearOpenCodeProjectIdCache();
+		expect(resolveOpenCodeProjectId({ overrideProjectId: "  custom  " })).toBe(
+			"custom",
+		);
+
+		// Env override wins over git.
+		const prev = process.env.OPENCODE_PROJECT;
+		process.env.OPENCODE_PROJECT = "env-project";
+		try {
+			clearOpenCodeProjectIdCache();
+			expect(resolveOpenCodeProjectId()).toBe("env-project");
+		} finally {
+			if (prev === undefined) delete process.env.OPENCODE_PROJECT;
+			else process.env.OPENCODE_PROJECT = prev;
+			clearOpenCodeProjectIdCache();
+		}
+
+		// Non-git directory falls back to the schema default.
+		clearOpenCodeProjectIdCache();
+		const dir = mkdtempSync(join(tmpdir(), "pi-free-nogit-"));
+		expect(resolveOpenCodeProjectId({ cwd: dir })).toBe("global");
+		clearOpenCodeProjectIdCache();
+	});
+
+	it("generates W3C traceparent + B3 with matching ids", () => {
+		const trace = createOpenCodeTraceHeaders();
+		expect(trace.traceparent).toMatch(/^00-[0-9a-f]{32}-[0-9a-f]{16}-01$/);
+		expect(trace.b3).toMatch(/^[0-9a-f]{32}-[0-9a-f]{16}-1$/);
+		const [traceId, spanId] = trace.traceparent.split("-").slice(1, 3);
+		expect(trace.b3).toBe(`${traceId}-${spanId}-1`);
+
+		const child = createOpenCodeTraceHeaders({
+			traceId,
+			spanId,
+			parentSpanId: "a3365e2649826dbd",
+		});
+		expect(child.b3).toBe(`${traceId}-${spanId}-1-a3365e2649826dbd`);
+		expect(child.traceparent).toBe(`00-${traceId}-${spanId}-01`);
 	});
 
 	it("encodes ses descending and prt ascending with the same ms base", () => {

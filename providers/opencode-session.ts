@@ -1,6 +1,7 @@
+import { execFileSync } from "node:child_process";
 import { existsSync, lstatSync, readFileSync } from "node:fs";
 import { basename, dirname, join } from "node:path";
-import { randomBytes } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 import { createRequire } from "node:module";
 import { pathToFileURL } from "node:url";
 import type {
@@ -35,9 +36,18 @@ export const OPENCODE_DYNAMIC_API = "opencode-dynamic" as const;
  */
 const OPENCODE_ANONYMOUS_API_KEY = "public";
 
+/**
+ * Native CLI identity (`packages/opencode/src/installation/index.ts`):
+ * `userAgent(client = "cli")` returns
+ * `opencode/${InstallationChannel}/${InstallationVersion}/${client}`.
+ * The wire sample for 2.0.29 is `opencode/latest/2.0.29/cli`.
+ */
+export const OPENCODE_USER_AGENT = "opencode/latest/2.0.29/cli";
+export const OPENCODE_CLIENT = "cli";
+
 const OPENCODE_STATIC_HEADERS = {
-	"User-Agent": "opencode/1.18.18",
-	"x-opencode-client": "cli",
+	"User-Agent": OPENCODE_USER_AGENT,
+	"x-opencode-client": OPENCODE_CLIENT,
 } as const;
 
 /**
@@ -98,17 +108,28 @@ export async function fetchOpenCodeModelIds(
  *
  * OpenCode's server uses checkHeaders to distinguish native CLI requests from
  * third-party clients, and applies a fallback rate limit (~2 req/day, the
- * "freeze") when the identity looks foreign. The real CLI (v1.18.18,
- * packages/opencode/src/session/llm/request.ts) sends:
+ * "freeze") when the identity looks foreign. The real CLI (v2.0.29,
+ * packages/opencode/src/session/llm/request.ts + installation/index.ts) sends:
  *
- *   x-opencode-session:  ses_ + descending ULID (26 chars: 12 hex + 14 base62)
- *   x-opencode-request:  prt_ + ascending ULID (a SessionV1 PartID)
- *   x-opencode-project:  the project id (schema default "global")
- *   x-opencode-client:   "cli" (OPENCODE_CLIENT default)
- *   User-Agent:          opencode/<version>
+ *   x-opencode-session:    ses_ + descending ULID (26 chars: 12 hex + 14 base62)
+ *   x-opencode-session-id: same session id (alias for affinity routing)
+ *   x-session-affinity:    same session id (transport alias, else-branch too)
+ *   x-session-id:          same session id (transport alias)
+ *   x-opencode-request:    prt_ + ascending ULID (a SessionV1 PartID)
+ *   x-opencode-project:    sha1(`git-remote:<host>/<path>`) or "global"
+ *   x-opencode-client:     "cli" (OPENCODE_CLIENT default)
+ *   User-Agent:            opencode/<channel>/<version>/cli
+ *   traceparent:           W3C `00-<traceId>-<spanId>-01` (OTEL, per request)
+ *   b3:                    Zipkin single `traceId-spanId-1` (same ids, root span)
  *
  * The ULID is `~timestamp<<12 | counter` encoded as 6 hex bytes then 14
- * base62 bytes (crypto random) — see packages/schema/src/identifier.ts.
+ * base62 bytes (crypto random) — see packages/opencode/src/id/id.ts.
+ * Project id is `Hash.fast(`git-remote:${normalized}`)` where Hash.fast is
+ * sha1-hex and normalized is the lowercased `host/path` without `.git`
+ * (see packages/core/src/project.ts). traceparent/b3 come from the OTEL
+ * fetch instrumentation, not from opencode code: fresh random traceId
+ * (16 bytes) + spanId (8 bytes) per request. The 4th b3 segment in some
+ * captures is the parent span id of a child span; root spans omit it.
  */
 const OPENCODE_ID_CHARS =
 	"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
@@ -170,22 +191,188 @@ export type OpenCodeSessionTracker = ReturnType<
 	typeof createOpenCodeSessionTracker
 >;
 
+/**
+ * Normalize a git remote URL to the `host/path` form used for project ids.
+ * Handles HTTPS (`https://github.com/owner/repo.git`) and SCP syntax
+ * (`git@github.com:owner/repo.git`). Returns undefined when the remote
+ * has no usable host/path (e.g. `file:` URLs, empty strings).
+ *
+ * Mirrors `url()` + `parts()` in `packages/core/src/project.ts`.
+ */
+export function normalizeOpenCodeGitRemote(remote: string): string | undefined {
+	const value = remote.trim();
+	if (!value) return undefined;
+
+	try {
+		const parsed = new URL(value);
+		if (parsed.protocol === "file:") return undefined;
+		return joinOpenCodeRemoteParts(parsed.hostname, parsed.pathname);
+	} catch {
+		const scp = value.match(/^([^@/:]+@)?([^/:]+):(.+)$/);
+		const scpHost = scp?.[2];
+		const scpPath = scp?.[3];
+		if (scp && scpHost && scpPath)
+			return joinOpenCodeRemoteParts(scpHost, scpPath);
+		return undefined;
+	}
+}
+
+function joinOpenCodeRemoteParts(
+	host: string,
+	name: string,
+): string | undefined {
+	const pathname = name
+		.replace(/^\/+/, "")
+		.replace(/\.git\/?$/, "")
+		.replace(/\/+$/, "");
+	if (!host || !pathname) return undefined;
+	return `${host.toLowerCase()}/${pathname}`;
+}
+
+/**
+ * Project id for a git remote: `sha1-hex("git-remote:<host>/<path>")`.
+ * Returns undefined when the remote cannot be normalized (caller falls
+ * back to `"global"`). Mirrors `remote()` in `packages/core/src/project.ts`
+ * where `Hash.fast` is sha1-hex and `ID.make(...)` keeps the hex as-is.
+ */
+export function openCodeProjectIdFromRemote(
+	remote: string,
+): string | undefined {
+	const normalized = normalizeOpenCodeGitRemote(remote);
+	if (!normalized) return undefined;
+	return createHash("sha1").update(`git-remote:${normalized}`).digest("hex");
+}
+
+let _cachedOpenCodeProjectId: string | undefined;
+
+/** Clear the cached project id (tests only). */
+export function clearOpenCodeProjectIdCache(): void {
+	_cachedOpenCodeProjectId = undefined;
+}
+
+/**
+ * Resolve the `x-opencode-project` value.
+ *
+ * Priority: explicit `overrideProjectId` > `OPENCODE_PROJECT` env >
+ * sha1 of the `origin` remote in `cwd` (defaults to `process.cwd()`) >
+ * `"global"` (schema default for non-git directories, see
+ * `Project.resolve` in `packages/core/src/project.ts`).
+ *
+ * Synchronous on purpose: `createOpenCodeHeaders` is sync and runs per
+ * LLM call. The git lookup is one `git remote get-url origin` spawn with
+ * a short timeout, executed once per process and then cached. Never throws.
+ */
+export function resolveOpenCodeProjectId(options?: {
+	cwd?: string | undefined;
+	overrideProjectId?: string | undefined;
+}): string {
+	const explicit = options?.overrideProjectId?.trim();
+	if (explicit) return explicit;
+	const env = process.env.OPENCODE_PROJECT?.trim();
+	if (env) return env;
+	if (_cachedOpenCodeProjectId) return _cachedOpenCodeProjectId;
+
+	const resolved = readOpenCodeProjectIdFromGit(options?.cwd);
+	_cachedOpenCodeProjectId = resolved ?? "global";
+	return _cachedOpenCodeProjectId;
+}
+
+function readOpenCodeProjectIdFromGit(cwd?: string): string | undefined {
+	try {
+		const remote = execFileSync("git", ["remote", "get-url", "origin"], {
+			cwd: cwd ?? process.cwd(),
+			stdio: ["ignore", "pipe", "ignore"],
+			timeout: 2000,
+			encoding: "utf-8",
+		}).trim();
+		if (!remote) return undefined;
+		return openCodeProjectIdFromRemote(remote);
+	} catch {
+		return undefined;
+	}
+}
+
+const HEX_32 = /^[0-9a-f]{32}$/;
+const HEX_16 = /^[0-9a-f]{16}$/;
+const ZERO_32 = "0".repeat(32);
+const ZERO_16 = "0".repeat(16);
+
+function randomHexTraceId(): string {
+	let id = randomBytes(16).toString("hex");
+	while (id === ZERO_32) id = randomBytes(16).toString("hex");
+	return id;
+}
+
+function randomHexSpanId(): string {
+	let id = randomBytes(8).toString("hex");
+	while (id === ZERO_16) id = randomBytes(8).toString("hex");
+	return id;
+}
+
+/**
+ * Fresh OTEL trace propagation headers for one request.
+ *
+ * `traceparent` follows W3C (`00-<traceId>-<spanId>-01`, sampled).
+ * `b3` follows Zipkin single-header (`<traceId>-<spanId>-1`); when
+ * `parentSpanId` is given, `<traceId>-<spanId>-1-<parentSpanId>` is emitted
+ * to match the 4-segment samples captured from child spans. Root requests
+ * omit the parent, which is the spec-correct default here.
+ */
+export function createOpenCodeTraceHeaders(options?: {
+	traceId?: string | undefined;
+	spanId?: string | undefined;
+	parentSpanId?: string | undefined;
+}): { traceparent: string; b3: string } {
+	const traceId =
+		options?.traceId && HEX_32.test(options.traceId)
+			? options.traceId.toLowerCase()
+			: randomHexTraceId();
+	const spanId =
+		options?.spanId && HEX_16.test(options.spanId)
+			? options.spanId.toLowerCase()
+			: randomHexSpanId();
+	const traceparent = `00-${traceId}-${spanId}-01`;
+	const parent =
+		options?.parentSpanId && HEX_16.test(options.parentSpanId)
+			? options.parentSpanId.toLowerCase()
+			: undefined;
+	return {
+		traceparent,
+		b3: parent ? `${traceId}-${spanId}-1-${parent}` : `${traceId}-${spanId}-1`,
+	};
+}
+
 export function createOpenCodeHeaders(
 	tracker: OpenCodeSessionTracker,
 	existingHeaders?: ProviderHeaders,
+	options?: { projectId?: string | undefined; cwd?: string | undefined },
 ): ProviderHeaders {
+	const sessionId = tracker.getSessionId();
+	const trace = createOpenCodeTraceHeaders();
 	return {
 		...existingHeaders,
 		...OPENCODE_STATIC_HEADERS,
-		"x-opencode-session": tracker.getSessionId(),
-		"x-opencode-request": tracker.nextRequestId(),
 		// The CLI sends the project id when present (schema default "global").
 		// Note: the deployed Zen backend's checkHeaders gate is currently
 		// disabled (production ipRateLimiter.ts hardcodes headersExist=true),
 		// so these headers are log/forward-compat only — the daily freeze is
 		// IP-based. Keep them faithful to the CLI wire format in case the gate
 		// is re-enabled.
-		"x-opencode-project": "global",
+		"x-opencode-project": resolveOpenCodeProjectId({
+			cwd: options?.cwd,
+			overrideProjectId: options?.projectId,
+		}),
+		// Session aliases: the opencode request path sends `x-opencode-session`,
+		// the session runner / transport also keys affinity off `x-session-affinity`
+		// + `X-Session-Id`. Send all four with the same value so Zen affinity
+		// routing sees a consistent session however it reads it.
+		"x-opencode-session": sessionId,
+		"x-opencode-session-id": sessionId,
+		"x-session-affinity": sessionId,
+		"x-session-id": sessionId,
+		"x-opencode-request": tracker.nextRequestId(),
+		traceparent: trace.traceparent,
+		b3: trace.b3,
 	};
 }
 
